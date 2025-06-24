@@ -452,6 +452,20 @@ class VLMGRPOTrainer(Trainer):
         for i, reward_func in enumerate(self.reward_funcs):
             if isinstance(reward_func, PreTrainedModel):
                 self.reward_funcs[i] = self.accelerator.prepare_model(reward_func, evaluation_mode=True)
+            elif isinstance(reward_func, torch.nn.Module):
+                # Handle custom nn.Module reward models like BGESimilarityReward
+                try:
+                    if is_deepspeed_zero3_enabled():
+                        self.reward_funcs[i] = prepare_deepspeed(reward_func, self.accelerator)
+                    else:
+                        # set device placement to True to make `prepare_model` move `reward_func` to device when using fsdp
+                        self.reward_funcs[i] = self.accelerator.prepare_model(
+                            reward_func, evaluation_mode=True, device_placement=True
+                        )
+                except Exception as e:
+                    print(f"Warning: Could not prepare reward model {reward_func.__class__.__name__}: {e}")
+                    # Keep the original model if preparation fails
+                    self.reward_funcs[i] = reward_func
 
     def _enable_gradient_checkpointing(self, model: PreTrainedModel, args: GRPOConfig) -> PreTrainedModel:
         """Enables gradient checkpointing for the model."""
@@ -650,6 +664,42 @@ class VLMGRPOTrainer(Trainer):
                 reward_inputs = super()._prepare_inputs(reward_inputs)
                 with torch.inference_mode():
                     rewards_per_func[:, i] = reward_func(**reward_inputs).logits[:, 0]  # Shape (B*G,)
+            elif isinstance(reward_func, torch.nn.Module):  # Handle BGESimilarityReward and other nn.Module rewards
+                # Handle DeepSpeed wrapped models
+                actual_model = reward_func.module if hasattr(reward_func, 'module') else reward_func
+                
+                # Special handling for BGESimilarityReward
+                if hasattr(actual_model, '_get_embeddings') and hasattr(actual_model, 'forward'):
+                    # This is likely a BGESimilarityReward instance
+                    if is_conversational(inputs[0]):
+                        completion_texts = [c[0]["content"] for c in completions]
+                    else:
+                        completion_texts = completions
+                    
+                    # Get solution texts from inputs
+                    solution_texts = []
+                    for example in inputs:
+                        solution_texts.append(example.get("solution", ""))
+                    
+                    with torch.inference_mode():
+                        similarities = actual_model.forward(
+                            solution_texts=solution_texts,
+                            completion_texts=completion_texts
+                        )
+                        rewards_per_func[:, i] = similarities
+                else:
+                    # Standard reward model handling for other nn.Module instances
+                    if is_conversational(inputs[0]):
+                        messages = [{"messages": p + c} for p, c in zip(prompts, completions)]
+                        texts = [apply_chat_template(x, reward_processing_class)["text"] for x in messages]
+                    else:
+                        texts = [p + c for p, c in zip(prompts, completions)]
+                    reward_inputs = reward_processing_class(
+                        text=texts, return_tensors="pt", padding=True, padding_side="right", add_special_tokens=False
+                    )
+                    reward_inputs = super()._prepare_inputs(reward_inputs)
+                    with torch.inference_mode():
+                        rewards_per_func[:, i] = reward_func(**reward_inputs).logits[:, 0]  # Shape (B*G,)
             else:
                 # Repeat all input columns (but "prompt" and "completion") to match the number of generations
                 reward_kwargs = {key: [] for key in inputs[0].keys() if key not in ["prompt", "completion"]}
@@ -692,6 +742,13 @@ class VLMGRPOTrainer(Trainer):
         for i, reward_func in enumerate(self.reward_funcs):
             if isinstance(reward_func, PreTrainedModel):
                 reward_func_name = reward_func.config._name_or_path.split("/")[-1]
+            elif isinstance(reward_func, torch.nn.Module):
+                # Handle DeepSpeed wrapped models
+                if hasattr(reward_func, 'module'):
+                    # This is likely a DeepSpeed wrapped model
+                    reward_func_name = reward_func.module.__class__.__name__
+                else:
+                    reward_func_name = reward_func.__class__.__name__
             else:
                 reward_func_name = reward_func.__name__
             self._metrics[f"rewards/{reward_func_name}"].append(reward_per_func[i].item())
